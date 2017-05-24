@@ -1,5 +1,9 @@
 ﻿// Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
+using Microsoft.Azure.KeyVault;
+using Microsoft.Azure.KeyVault.Models;
+using Microsoft.Azure.Management.KeyVault;
+using Microsoft.Azure.Management.KeyVault.Models;
 using Microsoft.Azure.Management.Resources;
 using Microsoft.Azure.Management.Resources.Models;
 using Microsoft.Azure.Management.Sql;
@@ -41,6 +45,20 @@ namespace Sql.Tests
         {
             handler.IsPassThrough = true;
             var client = context.GetServiceClient<ResourceManagementClient>(handlers: handler);
+            return client;
+        }
+
+        public static KeyVaultManagementClient GetKeyVaultManagementClient(MockContext context, RecordedDelegatingHandler handler)
+        {
+            handler.IsPassThrough = true;
+            var client = context.GetServiceClient<KeyVaultManagementClient>(handlers: handler);
+            return client;
+        }
+
+        public static KeyVaultClient GetKeyVaultClient(MockContext context, RecordedDelegatingHandler handler)
+        {
+            handler.IsPassThrough = true;
+            var client = context.GetServiceClient<KeyVaultClient>(handlers: handler);
             return client;
         }
 
@@ -324,6 +342,106 @@ namespace Sql.Tests
 
             // Wait for all databases to be created.
             return Task.WhenAll(createDbTasks);
+        }
+
+        internal static void RunTestWithTdeByokSetup(string suiteName, string testName, string testPrefix, Action<ResourceManagementClient, SqlManagementClient, ResourceGroup, Server, KeyBundle> test)
+        {
+            using (MockContext context = MockContext.Start(suiteName, testName))
+            {
+                var handler = new RecordedDelegatingHandler { StatusCodeToReturn = HttpStatusCode.OK };
+                var resourceClient = SqlManagementTestUtilities.GetResourceManagementClient(context, handler);
+                var sqlClient = SqlManagementTestUtilities.GetSqlManagementClient(context, handler);
+                var keyVaultManagementClient = SqlManagementTestUtilities.GetKeyVaultManagementClient(context, handler);
+                var keyVaultClient = SqlManagementTestUtilities.GetKeyVaultClient(context, handler);
+
+                ResourceGroup resourceGroup = null;
+
+                try
+                {
+                    string rgName = SqlManagementTestUtilities.GenerateName(testPrefix);
+                    resourceGroup = resourceClient.ResourceGroups.CreateOrUpdate(
+                        rgName,
+                        new ResourceGroup
+                        {
+                            Location = SqlManagementTestUtilities.DefaultLocation,
+                            Tags = new Dictionary<string, string>() { { rgName, DateTime.UtcNow.ToString("u") } }
+                        });
+
+                    string serverNameV12 = SqlManagementTestUtilities.GenerateName(testPrefix);
+                    string login = "dummylogin";
+                    string password = "Un53cuRE!";
+                    string version12 = "12.0";
+                    string location = "North Europe";
+                    Dictionary<string, string> tags = new Dictionary<string, string>()
+                    {
+                        { "tagKey1", "TagValue1" }
+                    };
+
+                    // Create server
+                    var server = sqlClient.Servers.CreateOrUpdate(resourceGroup.Name, serverNameV12, new Server()
+                    {
+                        AdministratorLogin = login,
+                        AdministratorLoginPassword = password,
+                        Version = version12,
+                        Tags = tags,
+                        Location = location,
+                        Identity =
+                    {
+                        Type = "SystemAssigned"
+                    }
+                    });
+                    SqlManagementTestUtilities.ValidateServer(server, serverNameV12, login, version12, tags, location);
+
+                    // Create database
+                    string databaseName = SqlManagementTestUtilities.GenerateName(testPrefix);
+                    var database = sqlClient.Databases.CreateOrUpdate(resourceGroup.Name, server.Name, databaseName, new Database()
+                    {
+                        Location = SqlManagementTestUtilities.DefaultLocation
+                    });
+
+                    // Enable TDE
+                    TransparentDataEncryption tde1 = sqlClient.Databases.CreateOrUpdateTransparentDataEncryptionConfiguration(resourceGroup.Name, server.Name, database.Name, new TransparentDataEncryption()
+                    {
+                        Status = TransparentDataEncryptionStatus.Enabled
+                    });
+                    Assert.Equal(TransparentDataEncryptionStatus.Enabled, tde1.Status);
+
+                    // Validate GET indicates TDE is on
+                    TransparentDataEncryption tde2 = sqlClient.Databases.GetTransparentDataEncryptionConfiguration(resourceGroup.Name, server.Name, database.Name);
+                    Assert.Equal(TransparentDataEncryptionStatus.Enabled, tde2.Status);
+
+
+
+                    // ACL the server identity to the vault, prepare ACL
+                    var aclEntry = new AccessPolicyEntry(server.Identity.TenantId.Value, server.Identity.PrincipalId.Value.ToString(), new Permissions()
+                    {
+                        Keys = new List<string>() { KeyPermissions.WrapKey, KeyPermissions.UnwrapKey, KeyPermissions.Get, KeyPermissions.List}
+                    });
+                    var accessPolicy = new List<AccessPolicyEntry>() { aclEntry };
+
+                    // create a vault and key
+                    string vaultName = SqlManagementTestUtilities.GenerateName(testPrefix);
+                    var vault = keyVaultManagementClient.Vaults.CreateOrUpdate(resourceGroup.Name, vaultName, new VaultCreateOrUpdateParameters()
+                    {
+                        Properties = new VaultProperties()
+                        {
+                            AccessPolicies = accessPolicy
+                        }
+                    });
+
+                    string keyName = SqlManagementTestUtilities.GenerateName(testPrefix);
+                    var key = await keyVaultClient.CreateKeyAsync(vault.Id, keyName, "kty");
+
+                    test(resourceClient, sqlClient, resourceGroup, server, key);
+                }
+                finally
+                {
+                    if (resourceGroup != null)
+                    {
+                        resourceClient.ResourceGroups.Delete(resourceGroup.Name);
+                    }
+                }
+            }
         }
     }
 }

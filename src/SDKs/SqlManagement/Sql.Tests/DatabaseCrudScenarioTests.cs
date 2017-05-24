@@ -280,32 +280,5 @@ namespace Sql.Tests
                 Assert.Equal(null, dbResult.ElasticPoolName);
             });
         }
-
-        [Fact]
-        public void TestDatabaseTransparentDataEncryptionConfiguration()
-        {
-            string testPrefix = "sqlcrudtest-";
-            string suiteName = this.GetType().FullName;
-            SqlManagementTestUtilities.RunTestInNewV12Server(suiteName, "TestDatabaseTransparentDataEncryptionConfiguration", testPrefix, (resClient, sqlClient, resourceGroup, server) =>
-            {
-                // Create database only required parameters
-                //
-                string dbName = SqlManagementTestUtilities.GenerateName(testPrefix);
-                var db1 = sqlClient.Databases.CreateOrUpdate(resourceGroup.Name, server.Name, dbName, new Database()
-                {
-                    Location = server.Location,
-                });
-                Assert.NotNull(db1);
-
-                // Get TDE config
-                var config = sqlClient.Databases.GetTransparentDataEncryptionConfiguration(resourceGroup.Name, server.Name, dbName);
-                Assert.Equal(TransparentDataEncryptionStatus.Disabled, config.Status);
-
-                // Update TDE config
-                config.Status = TransparentDataEncryptionStatus.Enabled;
-                config = sqlClient.Databases.CreateOrUpdateTransparentDataEncryptionConfiguration(resourceGroup.Name, server.Name, dbName, config);
-                Assert.Equal(TransparentDataEncryptionStatus.Enabled, config.Status);
-            });
-        }
     }
 }
